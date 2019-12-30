@@ -30,6 +30,9 @@
 #ifdef HAVE_LINUX_SERIAL
 #  include <linux/serial.h>
 #endif
+#ifdef HAVE_FREEBSD_UFTDI
+#  include <dev/usb/uftdiio.h>
+#endif
 #include <errno.h>
 #ifdef HAVE_PPOLL
 #  include <poll.h>
@@ -192,7 +195,7 @@ result_t SerialDevice::open() {
   struct termios newSettings;
 
   // open file descriptor
-  m_fd = ::open(m_name, O_RDWR | O_NOCTTY);
+  m_fd = ::open(m_name, O_RDWR | O_NOCTTY | O_NDELAY);
 
   if (m_fd < 0) {
     return RESULT_ERR_NOTFOUND;
@@ -215,13 +218,24 @@ result_t SerialDevice::open() {
   }
 #endif
 
+#ifdef HAVE_FREEBSD_UFTDI
+  int param = 0;
+  // flush tx/rx and set low latency on uftdi device
+  if (ioctl(m_fd, UFTDIIOC_GET_LATENCY, &param) == 0) {
+    ioctl(m_fd, UFTDIIOC_RESET_IO, &param);
+    param = 1;
+    ioctl(m_fd, UFTDIIOC_SET_LATENCY, &param);
+  }
+#endif
+
   // save current settings
   tcgetattr(m_fd, &m_oldSettings);
 
   // create new settings
   memset(&newSettings, 0, sizeof(newSettings));
 
-  newSettings.c_cflag |= (B2400 | CS8 | CLOCAL | CREAD);
+  cfsetspeed(&newSettings, B2400);
+  newSettings.c_cflag |= (CS8 | CLOCAL | CREAD);
   newSettings.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);  // non-canonical mode
   newSettings.c_iflag |= IGNPAR;  // ignore parity errors
   newSettings.c_oflag &= ~OPOST;
@@ -234,7 +248,10 @@ result_t SerialDevice::open() {
   tcflush(m_fd, TCIFLUSH);
 
   // activate new settings of serial device
-  tcsetattr(m_fd, TCSAFLUSH, &newSettings);
+  if (tcsetattr(m_fd, TCSAFLUSH, &newSettings)) {
+    close();
+    return RESULT_ERR_DEVICE;
+  }
 
   // set serial device into blocking mode
   fcntl(m_fd, F_SETFL, fcntl(m_fd, F_GETFL) & ~O_NONBLOCK);
@@ -282,6 +299,12 @@ result_t NetworkDevice::open() {
     ret = setsockopt(m_fd, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<void*>(&value), sizeof(value));
     value = 1;
     setsockopt(m_fd, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<void*>(&value), sizeof(value));
+    value = 3; // send keepalive after 3 seconds of silence
+    setsockopt(m_fd, IPPROTO_TCP, TCP_KEEPIDLE, reinterpret_cast<void*>(&value), sizeof(value));
+    value = 2; // send keepalive in interval of 2 seconds
+    setsockopt(m_fd, IPPROTO_TCP, TCP_KEEPINTVL, reinterpret_cast<void*>(&value), sizeof(value));
+    value = 2; // drop connection after 2 failed keep alive sends
+    setsockopt(m_fd, IPPROTO_TCP, TCP_KEEPCNT, reinterpret_cast<void*>(&value), sizeof(value));
   }
   if (ret >= 0) {
     ret = connect(m_fd, (struct sockaddr*)&m_address, sizeof(m_address));
@@ -295,12 +318,17 @@ result_t NetworkDevice::open() {
   }
   int cnt;
   symbol_t buf[MTU];
-  while (ioctl(m_fd, FIONREAD, &cnt) >= 0 && cnt > 1) {
+  int ioerr;
+  while ((ioerr=ioctl(m_fd, FIONREAD, &cnt)) >= 0 && cnt > 1) {
     // skip buffered input
     ssize_t read = ::read(m_fd, &buf, MTU);
     if (read <= 0) {
       break;
     }
+  }
+  if (ioerr < 0) {
+    close();
+    return RESULT_ERR_GENERIC_IO;
   }
   if (m_bufSize == 0) {
     m_bufSize = MAX_LEN+1;

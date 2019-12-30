@@ -22,6 +22,7 @@
 
 #include "ebusd/mqtthandler.h"
 #include <csignal>
+#include <deque>
 #include "lib/utils/log.h"
 
 namespace ebusd {
@@ -108,6 +109,15 @@ static const char* g_keypass = nullptr;   //!< client key file password for TLS
 
 bool parseTopic(const string& topic, vector<string>* strs, vector<string>* fields);
 
+static char* replaceSecret(char *arg) {
+  char* ret = strdup(arg);
+  int cnt = 0;
+  while (*arg && cnt++ < 256) {
+    *arg++ = ' ';
+  }
+  return ret;
+}
+
 /**
  * The MQTT argument parsing function.
  * @param key the key from @a g_mqtt_argp_options.
@@ -155,7 +165,7 @@ static error_t mqtt_parse_opt(int key, char *arg, struct argp_state *state) {
       argp_error(state, "invalid mqttpass");
       return EINVAL;
     }
-    g_password = arg;
+    g_password = replaceSecret(arg);
     break;
 
   case O_TOPI:  // --mqtttopic=ebusd
@@ -236,7 +246,7 @@ static error_t mqtt_parse_opt(int key, char *arg, struct argp_state *state) {
         argp_error(state, "invalid mqttkeypass");
         return EINVAL;
       }
-      g_keypass = arg;
+      g_keypass = replaceSecret(arg);
       break;
 #endif
 
@@ -425,7 +435,7 @@ void on_message(
 
 MqttHandler::MqttHandler(UserInfo* userInfo, BusHandler* busHandler, MessageMap* messages)
   : DataSink(userInfo, "mqtt"), DataSource(busHandler), WaitThread(), m_messages(messages), m_connected(false),
-    m_initialConnectFailed(false), m_lastUpdateCheckResult(".") {
+    m_initialConnectFailed(false), m_lastUpdateCheckResult("."), m_lastErrorLogTime(0) {
   m_publishByField = false;
   m_mosquitto = nullptr;
   if (g_topicFields.empty()) {
@@ -558,33 +568,43 @@ void MqttHandler::notifyTopic(const string& topic, const string& data) {
     return;
   }
   string direction = topic.substr(pos+1);
-  bool isWrite = false;
   if (direction.empty()) {
     return;
   }
-  isWrite = direction == "set";
-  if (!isWrite && direction != "get") {
+  bool isWrite = direction == "set";
+  bool isList = !isWrite && direction == "list";
+  if (!isWrite && !isList && direction != "get") {
     return;
   }
 
-  logOtherDebug("mqtt", "received topic %s", topic.c_str(), data.c_str());
+  logOtherDebug("mqtt", "received topic %s with data %s", topic.c_str(), data.c_str());
   string remain = topic.substr(0, pos);
   size_t last = 0;
   string circuit, name;
-  size_t idx;
-  for (idx = 0; idx < g_topicStrs.size()+1; idx++) {
+  bool finalField = false;
+  for (size_t idx = 0; idx < g_topicStrs.size()+1 && !finalField; idx++) {
     string field;
     string chk;
     if (idx < g_topicStrs.size()) {
       chk = g_topicStrs[idx];
       pos = remain.find(chk, last);
       if (pos == string::npos) {
-        return;
+        if (!isList) {
+          return;
+        }
+        if (idx == 0 && remain+"/" == chk) {  // check for only first prefix, e.g. "ebusd/"
+          break;
+        }
+        pos = remain.size();
+        finalField = true;
       }
     } else if (idx-1 < g_topicFields.size()) {
       pos = remain.size();
     } else if (last < remain.size()) {
-      return;
+      if (!isList) {
+        return;
+      }
+      break;
     } else {
       break;
     }
@@ -596,7 +616,10 @@ void MqttHandler::notifyTopic(const string& topic, const string& data) {
       }
     } else {
       if (field.empty()) {
-        return;
+        if (!isList) {
+          return;
+        }
+        continue;
       }
       string fieldName = g_topicFields[idx-1];
       if (fieldName == "circuit") {
@@ -610,10 +633,25 @@ void MqttHandler::notifyTopic(const string& topic, const string& data) {
       }
     }
   }
+  if (isList) {
+    logOtherInfo("mqtt", "received list topic for %s %s", circuit.c_str(), name.c_str());
+    deque<Message*> messages;
+    m_messages->findAll(circuit, name, m_levels, true, true, true, true, true, true, 0, 0, false, &messages);
+    bool onlyWithData = !data.empty();
+    for (const auto message : messages) {
+      time_t lastup = message->getLastUpdateTime();
+      if (onlyWithData && lastup == 0) {
+        continue;
+      }
+      ostringstream ostream;
+      publishMessage(message, &ostream, true);
+    }
+    return;
+  }
   if (name.empty()) {
     return;
   }
-  logOtherInfo("mqtt", "received topic for %s %s", circuit.c_str(), name.c_str());
+  logOtherInfo("mqtt", "received %s topic for %s %s", direction.c_str(), circuit.c_str(), name.c_str());
   Message* message = m_messages->find(circuit, name, m_levels, isWrite);
   if (message == nullptr) {
     message = m_messages->find(circuit, name, m_levels, isWrite, true);
@@ -623,7 +661,25 @@ void MqttHandler::notifyTopic(const string& topic, const string& data) {
     return;
   }
   if (!message->isPassive()) {
-    result_t result = m_busHandler->readFromBus(message, data);
+    string useData = data;
+    if (!isWrite && !data.empty()) {
+      size_t pos = useData.find_last_of('?');
+      if (pos != string::npos && pos > 0 && useData[pos-1] != UI_FIELD_SEPARATOR) {
+        pos = string::npos;
+      }
+      if (pos != string::npos) {
+        string args = useData.substr(pos + 1);
+        useData = useData.substr(0, pos > 0 ? pos - 1 : pos);
+        if (!args.empty()) {
+          result_t ret = RESULT_OK;
+          size_t pollPriority = (size_t)parseInt(args.c_str(), 10, 1, 9, &ret);
+          if (ret == RESULT_OK && pollPriority > 0 && message->setPollPriority(pollPriority)) {
+            m_messages->addPollMessage(false, message);
+          }
+        }
+      }
+    }
+    result_t result = m_busHandler->readFromBus(message, useData);
     if (result != RESULT_OK) {
       logOtherError("mqtt", "%s %s %s: %s", isWrite?"write":"read", circuit.c_str(), name.c_str(),
           getResultCode(result));
@@ -655,7 +711,7 @@ void MqttHandler::run() {
   bool allowReconnect = false;
   while (isRunning()) {
     bool wasConnected = m_connected;
-    handleTraffic(allowReconnect);
+    bool needsWait = handleTraffic(allowReconnect);
     bool reconnected = !wasConnected && m_connected;
     allowReconnect = false;
     time(&now);
@@ -681,48 +737,49 @@ void MqttHandler::run() {
         lastSignal = now;
         if (!signal || reconnected) {
           signal = true;
-          publishTopic(signalTopic, "true");
+          publishTopic(signalTopic, "true", true);
         }
       } else {
         if (signal || reconnected) {
           signal = false;
-          publishTopic(signalTopic, "false");
+          publishTopic(signalTopic, "false", true);
         }
       }
     }
     if (!m_updatedMessages.empty()) {
+      m_messages->lock();
       if (m_connected) {
-        m_messages->lock();
         for (auto it = m_updatedMessages.begin(); it != m_updatedMessages.end(); ) {
           const vector<Message*>* messages = m_messages->getByKey(it->first);
           if (messages) {
-            updates.str("");
-            updates.clear();
-            updates << dec;
             for (auto message : *messages) {
               if (message->getLastChangeTime() > 0 && message->isAvailable()
               && (!g_onlyChanges || message->getLastChangeTime() > lastUpdates)) {
+                updates.str("");
+                updates.clear();
+                updates << dec;
                 publishMessage(message, &updates);
               }
             }
           }
           it = m_updatedMessages.erase(it);
         }
-        m_messages->unlock();
         time(&lastUpdates);
       } else {
         m_updatedMessages.clear();
       }
+      m_messages->unlock();
     }
-    if (!m_connected && !Wait(5)) {
+    if ((!m_connected && !Wait(5)) || (needsWait && !Wait(1))) {
       break;
     }
   }
+  publishTopic(signalTopic, "false", true);
 }
 
-void MqttHandler::handleTraffic(bool allowReconnect) {
+bool MqttHandler::handleTraffic(bool allowReconnect) {
   if (!m_mosquitto) {
-    return;
+    return false;
   }
   int ret;
 #if (LIBMOSQUITTO_MAJOR >= 1)
@@ -730,7 +787,7 @@ void MqttHandler::handleTraffic(bool allowReconnect) {
 #else
   ret = mosquitto_loop(m_mosquitto, -1);  // waits up to 1 second for network traffic
 #endif
-  if (!m_connected && ret == MOSQ_ERR_NO_CONN && allowReconnect) {
+  if (!m_connected && (ret == MOSQ_ERR_NO_CONN || ret == MOSQ_ERR_CONN_LOST) && allowReconnect) {
     if (m_initialConnectFailed) {
 #if (LIBMOSQUITTO_MAJOR >= 1)
       ret = mosquitto_connect(m_mosquitto, g_host, g_port, 60);
@@ -752,15 +809,21 @@ void MqttHandler::handleTraffic(bool allowReconnect) {
     logOtherNotice("mqtt", "connection re-established");
   }
   if (!m_connected || ret == MOSQ_ERR_SUCCESS) {
-    return;
+    return false;
   }
   if (ret == MOSQ_ERR_NO_CONN || ret == MOSQ_ERR_CONN_LOST || ret == MOSQ_ERR_CONN_REFUSED) {
     logOtherError("mqtt", "communication error: %s", ret == MOSQ_ERR_NO_CONN ? "not connected"
                   : (ret == MOSQ_ERR_CONN_LOST ? "connection lost" : "connection refused"));
     m_connected = false;
   } else {
-    check(ret, "communication error");
+    time_t now;
+    time(&now);
+    if (now > m_lastErrorLogTime + 10) {  // log at most every 10 seconds
+      m_lastErrorLogTime = now;
+      check(ret, "communication error");
+    }
   }
+  return true;
 }
 
 string MqttHandler::getTopic(const Message* message, const string& suffix, const string& fieldName) {
@@ -784,10 +847,15 @@ string MqttHandler::getTopic(const Message* message, const string& suffix, const
   return ret.str();
 }
 
-void MqttHandler::publishMessage(const Message* message, ostringstream* updates) {
+void MqttHandler::publishMessage(const Message* message, ostringstream* updates, bool includeWithoutData) {
   OutputFormat outputFormat = g_publishFormat;
   bool json = outputFormat & OF_JSON;
+  bool noData = includeWithoutData && message->getLastUpdateTime() == 0;
   if (!m_publishByField) {
+    if (noData) {
+      publishEmptyTopic(getTopic(message));  // alternatively: , json ? "null" : "");
+      return;
+    }
     if (json) {
       *updates << "{";
     }
@@ -808,6 +876,10 @@ void MqttHandler::publishMessage(const Message* message, ostringstream* updates)
   }
   for (size_t index = 0; index < message->getFieldCount(); index++) {
     string name = message->getFieldName(index);
+    if (noData) {
+      publishEmptyTopic(getTopic(message, "", name));  // alternatively: , json ? "null" : "");
+      continue;
+    }
     result_t result = message->decodeLastData(false, nullptr, index, outputFormat, updates);
     if (result != RESULT_OK) {
       logOtherError("mqtt", "decode %s %s %s: %s", message->getCircuit().c_str(), message->getName().c_str(),
@@ -825,8 +897,14 @@ void MqttHandler::publishTopic(const string& topic, const string& data, bool ret
   const char* dataStr = data.c_str();
   const size_t len = strlen(dataStr);
   logOtherDebug("mqtt", "publish %s %s", topicStr, dataStr);
-  check(mosquitto_publish(m_mosquitto, nullptr, topic.c_str(), (uint32_t)len,
+  check(mosquitto_publish(m_mosquitto, nullptr, topicStr, (uint32_t)len,
       reinterpret_cast<const uint8_t*>(dataStr), 0, g_retain || retain), "publish");
+}
+
+void MqttHandler::publishEmptyTopic(const string& topic) {
+  const char* topicStr = topic.c_str();
+  logOtherDebug("mqtt", "publish empty %s", topicStr);
+  check(mosquitto_publish(m_mosquitto, nullptr, topicStr, 0, nullptr, 0, g_retain), "publish empty");
 }
 
 }  // namespace ebusd
